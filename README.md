@@ -1,3 +1,5 @@
+A fork of jsubroto's [flow](https://github.com/jsubroto/flow)
+
 # flow
 
 A keyboard-first Kanban board in your terminal.
