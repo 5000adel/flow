@@ -32,7 +32,7 @@ mod store_fs;
 use app::{Action, App};
 
 fn help_text() -> &'static str {
-    "h/l or ←/→ focus  j/k or ↑/↓ select  H/L move  n new  e edit  Enter detail  r refresh  Esc close/quit  q quit"
+    "h/l focus or ←/→ focus or ↑/↓ select  j/k select  H/L move  n new  e edit  r rename  d delete  Enter detail  Esc or q quit"
 }
 
 fn action_from_key(code: KeyCode) -> Option<Action> {
@@ -102,6 +102,8 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     let mut move_queue: VecDeque<(String, String)> = VecDeque::new();
     const MAX_QUEUE_SIZE: usize = 64;
     let mut quitting = false;
+    let mut renaming = false;
+    let mut rename_input = String::new();
 
     loop {
         if let Some(rx) = move_rx.as_ref() {
@@ -150,6 +152,76 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind == KeyEventKind::Press {
+                    if renaming {
+                        match k.code {
+                            KeyCode::Esc => {
+                                renaming = false;
+                                rename_input.clear();
+                                app.banner = None;
+                            }
+                            KeyCode::Enter => {
+                                // Save the new title
+                                let Some(col) = app.board.columns.get(app.col) else {
+                                    renaming = false;
+                                    continue;
+                                };
+                                let Some(card) = col.cards.get(app.row) else {
+                                    renaming = false;
+                                    continue;
+                                };
+                                let card_id = card.id.clone();
+                                let col_id = col.id.clone();
+
+                                let root = std::path::PathBuf::from(
+                                    std::env::var("FLOW_BOARD_PATH")
+                                        .unwrap_or_else(|_| format!("{}/.config/flow/boards/default",
+                                            std::env::var("HOME").unwrap_or_default()))
+                                );
+
+                                let card_path = root.join("cols").join(&col_id).join(format!("{card_id}.md"));
+
+                                if let Ok(contents) = std::fs::read_to_string(&card_path) {
+                                    let mut lines = contents.lines();
+                                    let first = lines.next().unwrap_or("");
+                                    let rest: Vec<&str> = lines.collect();
+                                    let _ = first; // discard old title line
+
+                                    let new_contents = if rest.is_empty() {
+                                        format!("# {}\n", rename_input)
+                                    } else {
+                                        format!("# {}\n{}", rename_input, rest.join("\n"))
+                                    };
+
+                                    match std::fs::write(&card_path, new_contents) {
+                                        Ok(_) => {
+                                            match provider.load_board() {
+                                                Ok(b) => {
+                                                    app.board = b;
+                                                    app.clamp();
+                                                    app.banner = Some("Renamed".to_string());
+                                                }
+                                                Err(e) => app.banner = Some(format!("Reload failed: {e}")),
+                                            }
+                                        }
+                                        Err(e) => app.banner = Some(format!("Rename failed: {e}")),
+                                    }
+                                }
+
+                                renaming = false;
+                                rename_input.clear();
+                            }
+                            KeyCode::Backspace => {
+                                rename_input.pop();
+                                app.banner = Some(format!("Rename: {rename_input}"));
+                            }
+                            KeyCode::Char(c) => {
+                                rename_input.push(c);
+                                app.banner = Some(format!("Rename: {rename_input}"));
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
                     if matches!(k.code, KeyCode::Char('n')) {
                         if quitting {
                             continue;
@@ -193,6 +265,67 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         ) {
                             app.banner = Some(msg);
                         }
+                        continue;
+                    }
+
+                    if matches!(k.code, KeyCode::Char('d')) {
+                        if quitting { continue; }
+                        let Some(col) = app.board.columns.get(app.col) else {
+                            app.banner = Some("Delete failed: no column selected".to_string());
+                            continue;
+                        };
+                        let Some(card) = col.cards.get(app.row) else {
+                            app.banner = Some("Delete failed: no card selected".to_string());
+                            continue;
+                        };
+                        let card_id = card.id.clone();
+                        let col_id = col.id.clone();
+                        
+                        // Remove from filesystem
+                        let root = std::path::PathBuf::from(
+                            std::env::var("FLOW_BOARD_PATH")
+                                .unwrap_or_else(|_| format!("{}/.config/flow/boards/default", 
+                                    std::env::var("HOME").unwrap_or_default()))
+                        );
+                        
+                        let card_path = root.join("cols").join(&col_id).join(format!("{card_id}.md"));
+                        let order_path = root.join("cols").join(&col_id).join("order.txt");
+                        
+                        if let Err(e) = std::fs::remove_file(&card_path) {
+                            app.banner = Some(format!("Delete failed: {e}"));
+                            continue;
+                        }
+                        
+                        // Remove from order.txt
+                        if let Ok(order) = std::fs::read_to_string(&order_path) {
+                            let new_order: String = order.lines()
+                                .filter(|l| l.trim() != card_id)
+                                .map(|l| format!("{l}\n"))
+                                .collect();
+                            let _ = std::fs::write(&order_path, new_order);
+                        }
+                        
+                        // Reload board
+                        match provider.load_board() {
+                            Ok(b) => { app.board = b; app.clamp(); app.banner = Some("Card deleted".to_string()); }
+                            Err(e) => app.banner = Some(format!("Reload failed: {e}")),
+                        }
+                        continue;
+                    }
+
+                    if matches!(k.code, KeyCode::Char('r')) {
+                        if quitting { continue; }
+                        let Some(col) = app.board.columns.get(app.col) else {
+                            app.banner = Some("Rename failed: no column selected".to_string());
+                            continue;
+                        };
+                        let Some(card) = col.cards.get(app.row) else {
+                            app.banner = Some("Rename failed: no card selected".to_string());
+                            continue;
+                        };
+                        rename_input = card.title.clone();
+                        renaming = true;
+                        app.banner = Some(format!("Rename: {rename_input}"));
                         continue;
                     }
 
@@ -326,7 +459,7 @@ fn open_in_editor(
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
 
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "nano".to_string());
     let status = Command::new(editor).arg(path).status();
 
     execute!(terminal.backend_mut(), EnterAlternateScreen)?;
@@ -494,8 +627,6 @@ fn draw_col(f: &mut Frame, app: &App, idx: usize, rect: Rect) {
         .iter()
         .map(|c| {
             ListItem::new(Line::from(vec![
-                Span::styled(&c.id, Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(" "),
                 Span::raw(c.title.clone()),
             ]))
         })
